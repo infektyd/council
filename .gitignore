@@ -1,0 +1,20 @@
+# Secrets
+config.env
+.env
+*.key
+
+# Logs
+scripts/logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+.__*
+
+# IDE
+.vscode/
+.idea/

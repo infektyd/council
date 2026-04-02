@@ -1,0 +1,57 @@
+{
+  "$schema": "https://fundingjson.org/schema/v1.1.0.json",
+  "version": "v1.1.0",
+  "entity": {
+    "type": "individual",
+    "role": "owner",
+    "name": "Hans Axelsson",
+    "email": "Haxelsson231@icloud.com",
+    "description": "Independent developer building open-source AI agent infrastructure — local-first multi-agent orchestration, native AI apps, memory systems, and low-level systems programming.",
+    "webpageUrl": {
+      "url": "https://github.com/infektyd"
+    }
+  },
+  "projects": [
+    {
+      "guid": "council",
+      "name": "Council",
+      "description": "Multi-agent orchestration skill for OpenClaw. Routes tasks to specialized AI personas (Workhorse, Creative, Speed), runs parallel deliberation across different Grok model variants, synthesizes verdicts, and produces auditable transcripts. Minimal scaffolding — agents self-coordinate rather than following rigid hierarchies.",
+      "webpageUrl": {
+        "url": "https://github.com/infektyd/council"
+      },
+      "repositoryUrl": {
+        "url": "https://github.com/infektyd/council"
+      },
+      "licenses": ["spdx:MIT"],
+      "tags": ["ai-agents", "multi-agent", "orchestration", "openclaw", "grok", "local-first"]
+    }
+  ],
+  "funding": {
+    "channels": [
+      {
+        "guid": "bank-transfer",
+        "type": "bank",
+        "address": "",
+        "description": "Direct bank transfer available. Please email for details."
+      },
+      {
+        "guid": "payment-provider",
+        "type": "payment-provider",
+        "address": "",
+        "description": "Payment provider details coming soon."
+      }
+    ],
+    "plans": [
+      {
+        "guid": "development",
+        "status": "active",
+        "name": "Development support",
+        "description": "Support ongoing development of open-source multi-agent AI orchestration tooling — council deliberation, agent coordination, and auditable decision-making infrastructure.",
+        "amount": 0,
+        "currency": "USD",
+        "frequency": "one-time",
+        "channels": ["bank-transfer", "payment-provider"]
+      }
+    ]
+  }
+}
