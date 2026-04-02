@@ -1,170 +1,273 @@
 """
-bridge.py — xAI API wrapper for the Council skill.
+bridge.py — xAI API bridge with retry, model routing, and structured response parsing.
 
-Handles authentication, request construction, retry logic, and response
-parsing. Provides a clean interface (call_model / BridgeResult) for the
-conductor to use without touching HTTP details.
+This module is the only place that talks to the xAI API.
+Every other module calls bridge.call_model() and gets back a BridgeResult.
 """
 
 import json
-import logging
 import time
-import urllib.error
-import urllib.request
-from dataclasses import dataclass
-from typing import Optional
+import logging
+from dataclasses import dataclass, field
 
-import config
+import requests  # type: ignore
 
-log = logging.getLogger("council.bridge")
+from config import (
+    XAI_API_KEY, XAI_API_URL, MAX_RETRIES, API_TIMEOUT,
+    MODELS, PERSONAS, log,
+)
 
+# ---------------------------------------------------------------------------
+# Result envelope from the bridge
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BridgeResult:
-    """Structured result from a single model call."""
     ok: bool
-    text: str
-    error: str
-    model: str
-    latency_s: float
+    text: str = ""
+    error: str = ""
+    model: str = ""
+    persona: str = ""
+    latency_s: float = 0.0
+    raw_response: dict = field(default_factory=dict)
 
+    def to_dict(self) -> dict:
+        return {
+            "ok": self.ok,
+            "text": self.text[:500] if self.ok else "",
+            "error": self.error,
+            "model": self.model,
+            "persona": self.persona,
+            "latency_s": round(self.latency_s, 2),
+        }
 
-def _extract_text(payload: dict) -> str:
-    """Extract the response text from an xAI /v1/responses payload."""
-    # Responses API format
-    output = payload.get("output")
-    if isinstance(output, list):
-        chunks = []
-        for item in output:
-            content = item.get("content", []) if isinstance(item, dict) else []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "output_text":
-                    text = block.get("text", "")
-                    if text:
-                        chunks.append(text)
-        if chunks:
-            return "\n".join(chunks).strip()
+# ---------------------------------------------------------------------------
+# Response parsing — handles the multiple formats xAI returns
+# ---------------------------------------------------------------------------
 
-    # Chat completions fallback
-    choices = payload.get("choices")
-    if isinstance(choices, list) and choices:
-        msg = choices[0].get("message", {})
-        content = msg.get("content", "") if isinstance(msg, dict) else ""
-        if isinstance(content, str) and content.strip():
-            return content.strip()
+def _parse_response(data: dict) -> str:
+    """Extract text from xAI /v1/responses JSON. Handles known variants."""
+    # Format 1: output[].content[].text (multi-agent and standard responses)
+    if "output" in data:
+        outputs = data["output"]
+        if isinstance(outputs, list):
+            texts = []
+            for item in outputs:
+                if isinstance(item, dict) and "content" in item:
+                    for block in item["content"]:
+                        if isinstance(block, dict) and block.get("type") == "output_text":
+                            texts.append(block.get("text", ""))
+            if texts:
+                return "\n".join(texts)
+            # Fallback: stringify the output list
+            return str(outputs)
+        return str(outputs)
 
-    raise RuntimeError("xAI response did not contain extractable text")
+    # Format 2: top-level text
+    if "text" in data:
+        return data["text"]
 
+    # Format 3: OpenAI-compatible choices
+    if "choices" in data:
+        try:
+            return data["choices"][0]["message"]["content"]
+        except (IndexError, KeyError, TypeError):
+            pass
+
+    return f"[PARSE_ERROR] Unexpected response format: {json.dumps(data, indent=2)[:500]}"
+
+# ---------------------------------------------------------------------------
+# Core API call
+# ---------------------------------------------------------------------------
 
 def call_model(
     prompt: str,
     persona: str = "workhorse",
-    model_override: Optional[str] = None,
+    *,
+    system_override: str | None = None,
+    model_override: str | None = None,
+    temperature: float = 0.7,
+    max_tokens: int = 16384,
+    reasoning_effort: str = "high",
 ) -> BridgeResult:
     """
-    Call the xAI API for a given persona.
+    Call an xAI Grok model with retry and structured result.
 
-    Args:
-        prompt: The full prompt text to send.
-        persona: One of "workhorse", "creative", "speed", "conductor".
-        model_override: Optional model slug to use instead of the persona default.
-
-    Returns:
-        BridgeResult with ok=True and text on success, or ok=False and error on failure.
+    Parameters
+    ----------
+    prompt : str
+        The user-facing prompt (task + context).
+    persona : str
+        One of: workhorse, creative, speed, conductor.
+    system_override : str, optional
+        Replace the default system prompt for this persona.
+    model_override : str, optional
+        Force a specific model slug instead of the persona default.
+    temperature : float
+        Sampling temperature (0.0-2.0).
+    max_tokens : int
+        Max output tokens.
+    reasoning_effort : str
+        For multi-agent models, this controls agent count via REST API:
+          "low" / "medium" = 4 agents
+          "high" / "xhigh" = 16 agents
+        For single models, this controls reasoning depth.
+        Note: agent_count is xAI SDK only; REST API uses reasoning.effort.
     """
-    if not config.XAI_API_KEY:
-        return BridgeResult(
-            ok=False, text="", error="No API key configured",
-            model="", latency_s=0.0,
-        )
+    if not XAI_API_KEY:
+        return BridgeResult(ok=False, error="XAI_API_KEY not configured", persona=persona)
 
-    # Resolve model
+    # Resolve model and system prompt
+    model_slug, is_multi = MODELS.get(persona, MODELS["workhorse"])
     if model_override:
         model_slug = model_override
-        is_multi = "multi-agent" in model_override.lower()
-    else:
-        model_slug, is_multi = config.MODELS.get(persona, config.MODELS["workhorse"])
+        is_multi = "multi-agent" in model_override
 
-    # Build system prompt
-    system_prompt = config.PERSONAS.get(persona, config.PERSONAS["workhorse"])
+    system_prompt = system_override or PERSONAS.get(persona, PERSONAS["workhorse"])
 
-    # Build request body
-    body_dict = {
+    # Build payload
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+
+    payload: dict = {
         "model": model_slug,
-        "input": prompt,
-        "instructions": system_prompt,
+        "input": messages,
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
     }
 
-    # Multi-agent models use reasoning.effort to control agent count
-    if is_multi:
-        body_dict["reasoning"] = {"effort": "high"}
-
-    body = json.dumps(body_dict).encode("utf-8")
+    if reasoning_effort and is_multi:
+        payload["reasoning"] = {"effort": reasoning_effort}
 
     headers = {
-        "Authorization": f"Bearer {config.XAI_API_KEY}",
+        "Authorization": f"Bearer {XAI_API_KEY}",
         "Content-Type": "application/json",
     }
 
+    # Retry loop
     last_error = ""
-    for attempt in range(1, config.MAX_RETRIES + 2):  # +2 because range is exclusive and we want retries + 1 attempts
+    for attempt in range(1, MAX_RETRIES + 2):  # +2 because range is exclusive and attempt 1 is the first try
         t0 = time.monotonic()
         try:
-            req = urllib.request.Request(
-                config.XAI_API_URL,
-                data=body,
+            log.info(f"Bridge call attempt {attempt}/{MAX_RETRIES + 1}: "
+                     f"persona={persona} model={model_slug}")
+
+            resp = requests.post(
+                XAI_API_URL,
+                json=payload,
                 headers=headers,
-                method="POST",
+                timeout=API_TIMEOUT,
             )
-            with urllib.request.urlopen(req, timeout=config.API_TIMEOUT) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
 
             latency = time.monotonic() - t0
-            text = _extract_text(payload)
 
-            log.info(
-                "OK persona=%s model=%s latency=%.1fs len=%d",
-                persona, model_slug, latency, len(text),
-            )
-            return BridgeResult(
-                ok=True, text=text, error="",
-                model=model_slug, latency_s=round(latency, 2),
-            )
-
-        except urllib.error.HTTPError as exc:
-            latency = time.monotonic() - t0
-            err_body = exc.read().decode("utf-8", errors="ignore")[:300]
-            last_error = f"HTTP {exc.code}: {err_body}"
-            log.warning(
-                "FAIL attempt=%d/%d persona=%s model=%s error=%s",
-                attempt, config.MAX_RETRIES + 1, persona, model_slug, last_error,
-            )
-            # Retry on 429 (rate limit) and 5xx
-            if exc.code == 429 or exc.code >= 500:
-                backoff = min(2 ** attempt, 30)
-                log.info("Retrying in %ds...", backoff)
-                time.sleep(backoff)
+            # Rate limit — back off and retry
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", "10"))
+                log.warning(f"Rate limited. Sleeping {retry_after}s before retry.")
+                time.sleep(retry_after)
+                last_error = f"Rate limited (429). Retried after {retry_after}s."
                 continue
-            break  # Don't retry 4xx (except 429)
 
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            latency = time.monotonic() - t0
-            last_error = str(exc)
-            log.warning(
-                "FAIL attempt=%d/%d persona=%s error=%s",
-                attempt, config.MAX_RETRIES + 1, persona, last_error,
+            # Server error — retry
+            if resp.status_code >= 500:
+                log.warning(f"Server error {resp.status_code}. Retrying.")
+                time.sleep(3 * attempt)
+                last_error = f"Server error {resp.status_code}: {resp.text[:200]}"
+                continue
+
+            # Client error (4xx) — do not retry (except 429 above)
+            if resp.status_code >= 400:
+                error_detail = resp.text[:500]
+                log.error(f"Client error {resp.status_code}: {error_detail}")
+                return BridgeResult(
+                    ok=False,
+                    error=f"HTTP {resp.status_code}: {error_detail}",
+                    model=model_slug,
+                    persona=persona,
+                    latency_s=latency,
+                )
+
+            # Success
+            data = resp.json()
+            text = _parse_response(data)
+
+            if text.startswith("[PARSE_ERROR]"):
+                return BridgeResult(
+                    ok=False,
+                    error=text,
+                    model=model_slug,
+                    persona=persona,
+                    latency_s=latency,
+                    raw_response=data,
+                )
+
+            return BridgeResult(
+                ok=True,
+                text=text,
+                model=model_slug,
+                persona=persona,
+                latency_s=latency,
+                raw_response=data,
             )
-            backoff = min(2 ** attempt, 30)
-            time.sleep(backoff)
+
+        except requests.exceptions.Timeout:
+            latency = time.monotonic() - t0
+            log.warning(f"Timeout after {latency:.1f}s on attempt {attempt}.")
+            last_error = f"Timeout after {latency:.1f}s"
             continue
 
-        except RuntimeError as exc:
+        except requests.exceptions.ConnectionError as e:
             latency = time.monotonic() - t0
-            last_error = str(exc)
-            log.error("Parse error persona=%s: %s", persona, last_error)
-            break
+            log.warning(f"Connection error on attempt {attempt}: {e}")
+            last_error = f"Connection error: {e}"
+            time.sleep(3 * attempt)
+            continue
 
+        except Exception as e:
+            latency = time.monotonic() - t0
+            log.error(f"Unexpected error on attempt {attempt}: {e}")
+            return BridgeResult(
+                ok=False,
+                error=f"Unexpected error: {e}",
+                model=model_slug,
+                persona=persona,
+                latency_s=latency,
+            )
+
+    # All retries exhausted
     return BridgeResult(
-        ok=False, text="", error=last_error,
-        model=model_slug, latency_s=round(time.monotonic() - t0, 2),
+        ok=False,
+        error=f"All {MAX_RETRIES + 1} attempts failed. Last error: {last_error}",
+        model=model_slug,
+        persona=persona,
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point for direct testing
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python bridge.py [--persona PERSONA] \"prompt\"")
+        print(f"  Personas: {', '.join(MODELS.keys())}")
+        sys.exit(1)
+
+    args = sys.argv[1:]
+    persona = "workhorse"
+    if "--persona" in args:
+        idx = args.index("--persona")
+        persona = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
+    prompt = " ".join(args)
+    result = call_model(prompt, persona=persona)
+
+    if result.ok:
+        print(result.text)
+    else:
+        print(f"[ERROR] {result.error}", file=sys.stderr)
+        sys.exit(1)
