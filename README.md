@@ -102,30 +102,60 @@ The persona's response is the council's verdict. Fast and token-efficient.
 
 ### Deliberation
 
-Multi-round with parallel execution and model diversity:
+Multi-round with parallel execution across three distinct model tiers:
 
-- **WORKHORSE**, **CREATIVE**, and **SPEED** each produce a response in parallel
-- Supports different model variants per persona slot via environment variables
-- The **CONDUCTOR** persona synthesizes a final verdict from all inputs
+- **WORKHORSE** (Grok 4.20 Reasoning) — deep single-thread analysis
+- **CREATIVE** (Grok 4.20 Multi-Agent) — fans out to 4–16 internal sub-agents per call
+- **SPEED** (Grok 4.1 Fast Reasoning) — fast, cheap baseline
+- All three fire in parallel, then **CONDUCTOR** (Grok 4.20 Multi-Agent) synthesizes a final verdict
+- Per-persona model overrides via environment variables
 - Use for architecture decisions, tradeoff analysis, creative brainstorming
 
-## Personas
+## Personas & Model Diversity
 
-| Persona    | Default Model                           | Role                                        |
-|-----------|----------------------------------------|---------------------------------------------|
-| WORKHORSE | `grok-4.20-beta-0309-reasoning`        | Deep technical reasoning, architecture, debug |
-| CREATIVE  | `grok-4.20-multi-agent-beta-0309`      | Divergent thinking, novel ideas (4/16 agents) |
-| SPEED     | `grok-4-1-fast-reasoning`              | Rapid answers, summaries, small fixes         |
-| CONDUCTOR | `grok-4.20-multi-agent-beta-0309`      | Synthesis, final verdicts, tiebreaking        |
+Council doesn't just prompt-switch on one model — it orchestrates across three
+distinct Grok model tiers simultaneously, each with fundamentally different
+cost/capability profiles:
 
-Model diversity in deliberation mode:
+| Persona    | Default Model                           | Tier | Role                                        |
+|-----------|----------------------------------------|------|---------------------------------------------|
+| WORKHORSE | `grok-4.20-beta-0309-reasoning`        | Reasoning | Deep-focus technical analysis — burns tokens deep. Architecture, debugging, sustained multi-step reasoning. |
+| CREATIVE  | `grok-4.20-multi-agent-beta-0309`      | Multi-Agent | Goes wide, not deep. xAI's multi-agent model spawns 4–16 internal sub-agents per call (controlled via `reasoning.effort`). Novel ideas, divergent exploration, creative chaos. |
+| SPEED     | `grok-4-1-fast-reasoning`              | Fast Reasoning | Keeps things tight. Rapid answers, summaries, small fixes. Low latency, low cost. |
+| CONDUCTOR | `grok-4.20-multi-agent-beta-0309`      | Multi-Agent | Synthesizes all persona outputs into a final verdict. Uses multi-agent internally to weigh competing perspectives. |
+
+**Why this matters:** In deliberation mode, a single council round fires three
+parallel API calls across three model tiers, then a fourth for synthesis. The
+Workhorse reasons deeply on one thread. The Creative fans out to 4–16 internal
+agents exploring in parallel. The Speed runner returns a fast baseline. The
+Conductor then synthesizes all of it — itself using multi-agent inference to
+weigh the competing outputs. This is model diversity as architecture, not just
+prompt engineering.
+
+**Token cost per deliberation round:**
+Creative and Conductor use `grok-4.20-multi-agent` ($2/Mtok) and each can spawn
+up to 16 internal agents. Workhorse uses `grok-4.20-reasoning` ($2/Mtok) for
+single-thread depth. Speed uses `grok-4-1-fast-reasoning` ($0.20/Mtok) for the
+baseline. A full deliberation round with high effort can consume significant
+tokens — plan accordingly.
+
+### Model overrides
+
+Swap models per persona via environment variables:
 
 ```bash
 COUNCIL_DELIBERATION_WORKHORSE_MODEL=grok-4-0709 \
-COUNCIL_DELIBERATION_CREATIVE_MODEL=grok-4.20-multi-agent-experimental-beta-0304 \
+COUNCIL_DELIBERATION_CREATIVE_MODEL=grok-4.20-multi-agent-beta-0309 \
 COUNCIL_DELIBERATION_SPEED_MODEL=grok-4-1-fast-reasoning \
 python3 scripts/conductor.py --mode deliberation "Your prompt here."
 ```
+
+Multi-agent effort (controls internal agent count for multi-agent models):
+- `low` / `medium` → 4 agents
+- `high` / `xhigh` → 16 agents
+
+Set via `reasoning.effort` in the API payload (REST). The `agent_count` param
+is xAI SDK only — REST ignores it.
 
 ## Result Envelope
 
